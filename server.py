@@ -2,6 +2,13 @@
 """
 server.py — 运行在机器B上
 监听本地 TCP 端口，等待 agent.py 的连接，提供交互式命令行界面
+
+启动模式：
+  python3 server.py                         # 前台交互式
+  python3 server.py --non-interactive       # 后台静默运行
+  python3 server.py attach                  # 连接到后台运行的 server，进入交互
+
+后台运行时通过 Unix socket（默认 /tmp/remote-exec.sock）接受 attach 连接。
 """
 
 import sys
@@ -13,6 +20,7 @@ import uuid
 import logging
 import argparse
 import readline  # noqa: F401  — 启用命令行历史
+import os
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,6 +30,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 HEARTBEAT_INTERVAL = 15
+DEFAULT_CTRL_SOCK = "/tmp/remote-exec.sock"
 
 
 class AgentConn:
@@ -149,17 +158,17 @@ def _cleanup():
             del agents[k]
 
 
-def list_agents():
+def list_agents(out=print):
     _cleanup()
     with agents_lock:
         if not agents:
-            print("（无已连接的 Agent）")
+            out("（无已连接的 Agent）")
         else:
             for i, (name, ag) in enumerate(agents.items(), 1):
-                print(f"  [{i}] {name}  ({ag.addr})")
+                out(f"  [{i}] {name}  ({ag.addr})")
 
 
-def select_agent(spec: str) -> AgentConn | None:
+def select_agent(spec: str, out=print) -> AgentConn | None:
     _cleanup()
     with agents_lock:
         keys = list(agents.keys())
@@ -174,7 +183,7 @@ def select_agent(spec: str) -> AgentConn | None:
         for k in keys:
             if k.startswith(spec):
                 return agents[k]
-    print(f"找不到 Agent: {spec!r}")
+    out(f"找不到 Agent: {spec!r}")
     return None
 
 
@@ -183,14 +192,24 @@ HELP = """
   list                  列出已连接的 Agent
   use <n|hostname>      选择 Agent（编号或主机名前缀）
   <shell命令>           在当前 Agent 上执行命令
-  exit / quit           退出
+  exit / quit           退出（后台模式下仅断开 attach，server 继续运行）
   help / ?              显示此帮助
 """
 
 
-def interactive(default_agent: AgentConn | None = None):
+def interactive(out=None, inp=None, default_agent: AgentConn | None = None):
+    """
+    交互式 REPL。
+    out: 输出函数，默认 print
+    inp: 输入函数，默认 input
+    """
+    if out is None:
+        out = print
+    if inp is None:
+        inp = input
+
     current: AgentConn | None = default_agent
-    print("server 已就绪。输入 help 查看命令。")
+    out("server 已就绪。输入 help 查看命令。")
 
     while True:
         if current:
@@ -199,9 +218,9 @@ def interactive(default_agent: AgentConn | None = None):
             prompt = "[未选择]> "
 
         try:
-            line = input(prompt).strip()
+            line = inp(prompt).strip()
         except (EOFError, KeyboardInterrupt):
-            print()
+            out("")
             break
 
         if not line:
@@ -210,41 +229,170 @@ def interactive(default_agent: AgentConn | None = None):
         if line in ("exit", "quit"):
             break
         elif line in ("help", "?"):
-            print(HELP)
+            out(HELP)
         elif line == "list":
-            list_agents()
+            list_agents(out)
         elif line.startswith("use "):
             spec = line[4:].strip()
-            ag = select_agent(spec)
+            ag = select_agent(spec, out)
             if ag:
                 current = ag
-                print(f"已切换到: {current.hostname}")
+                out(f"已切换到: {current.hostname}")
         else:
             # 当作 shell 命令发给当前 Agent
             if current is None:
-                print("请先用 'use <n>' 选择一个 Agent，或等待 Agent 连接")
+                out("请先用 'use <n>' 选择一个 Agent，或等待 Agent 连接")
                 continue
             if not current.alive:
-                print("当前 Agent 已断开，请重新 use")
+                out("当前 Agent 已断开，请重新 use")
                 current = None
                 continue
             result = current.exec(line)
             if result.get("stdout"):
-                print(result["stdout"], end="" if result["stdout"].endswith("\n") else "\n")
+                out(result["stdout"] if result["stdout"].endswith("\n") else result["stdout"] + "\n", end="")
             if result.get("stderr"):
-                print(f"\033[33m[stderr]\033[0m {result['stderr']}")
+                out(f"\033[33m[stderr]\033[0m {result['stderr']}")
             rc = result.get("returncode", 0)
             if rc != 0:
-                print(f"\033[31m[exit {rc}]\033[0m")
+                out(f"\033[31m[exit {rc}]\033[0m")
+
+
+# ── Unix socket 控制通道（non-interactive 模式用）──────────
+def _handle_attach(conn: socket.socket):
+    """处理一个 attach 客户端连接，提供完整的交互式会话"""
+    f = conn.makefile("rwb", buffering=0)
+
+    def out(text, end="\n"):
+        try:
+            line = text if text.endswith("\n") else text + end
+            f.write(line.encode())
+            f.flush()
+        except Exception:
+            pass
+
+    def inp(prompt=""):
+        try:
+            f.write(prompt.encode())
+            f.flush()
+            data = b""
+            while True:
+                ch = f.read(1)
+                if not ch or ch == b"\n":
+                    break
+                data += ch
+            return data.decode("utf-8", errors="replace").rstrip("\r")
+        except Exception:
+            raise EOFError
+
+    try:
+        interactive(out=out, inp=inp)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def ctrl_accept_loop(ctrl_sock: socket.socket):
+    """接受 attach 连接，每个连接开一个线程"""
+    while True:
+        try:
+            conn, _ = ctrl_sock.accept()
+        except Exception:
+            break
+        t = threading.Thread(target=_handle_attach, args=(conn,), daemon=True)
+        t.start()
+
+
+def start_ctrl_socket(path: str) -> socket.socket:
+    """创建并监听控制 Unix socket"""
+    if os.path.exists(path):
+        os.remove(path)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.bind(path)
+    sock.listen(5)
+    t = threading.Thread(target=ctrl_accept_loop, args=(sock,), daemon=True)
+    t.start()
+    log.info(f"控制 socket 监听: {path}")
+    return sock
+
+
+# ── attach 客户端 ───────────────────────────────────────────
+def do_attach(path: str):
+    """连接到后台 server 的控制 socket，进行交互"""
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(path)
+    except FileNotFoundError:
+        print(f"找不到控制 socket: {path}，server 是否已用 --non-interactive 启动？")
+        sys.exit(1)
+    except ConnectionRefusedError:
+        print(f"连接被拒绝: {path}，server 可能已退出")
+        sys.exit(1)
+
+    f = s.makefile("rwb", buffering=0)
+
+    # 两个线程：一个读 server 输出并打印，一个读本地输入并发送
+    stop = threading.Event()
+
+    def reader():
+        try:
+            while not stop.is_set():
+                ch = f.read(1)
+                if not ch:
+                    break
+                sys.stdout.buffer.write(ch)
+                sys.stdout.buffer.flush()
+        finally:
+            stop.set()
+
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+
+    try:
+        while not stop.is_set():
+            try:
+                line = input()
+            except (EOFError, KeyboardInterrupt):
+                break
+            try:
+                f.write((line + "\n").encode())
+                f.flush()
+            except Exception:
+                break
+    finally:
+        stop.set()
+        s.close()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Server: 运行在控制机B，等待 Agent 连接")
+    parser = argparse.ArgumentParser(
+        description="Server: 运行在控制机B，等待 Agent 连接",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    # attach 子命令
+    attach_parser = subparsers.add_parser("attach", help="连接到后台运行的 server，进入交互")
+    attach_parser.add_argument("--ctrl-sock", default=DEFAULT_CTRL_SOCK,
+                               help=f"控制 socket 路径（默认 {DEFAULT_CTRL_SOCK}）")
+
+    # 默认启动参数（加在主 parser 上）
     parser.add_argument("--bind", default="127.0.0.1",
-                        help="监听地址（默认 127.0.0.1，仅接受 SSH 隧道；0.0.0.0 开放所有接口）")
+                        help="监听地址（默认 127.0.0.1）")
     parser.add_argument("--port", type=int, default=9876, help="监听端口（默认9876）")
+    parser.add_argument("--non-interactive", action="store_true",
+                        help="后台运行，不进入交互式界面，通过 attach 子命令连接操作")
+    parser.add_argument("--ctrl-sock", default=DEFAULT_CTRL_SOCK,
+                        help=f"控制 socket 路径（默认 {DEFAULT_CTRL_SOCK}，仅 --non-interactive 时有效）")
+
     args = parser.parse_args()
 
+    if args.command == "attach":
+        do_attach(args.ctrl_sock)
+        return
+
+    # 启动 TCP 监听
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_sock.bind((args.bind, args.port))
@@ -254,7 +402,18 @@ def main():
     t = threading.Thread(target=accept_loop, args=(server_sock,), daemon=True)
     t.start()
 
-    interactive()
+    if args.non_interactive:
+        start_ctrl_socket(args.ctrl_sock)
+        print(f"server 后台运行中。使用以下命令进入交互：")
+        print(f"  python3 server.py attach --ctrl-sock {args.ctrl_sock}")
+        # 主线程保持运行
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            pass
+    else:
+        interactive()
 
     server_sock.close()
     log.info("Server 已退出")
