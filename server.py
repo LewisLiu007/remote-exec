@@ -658,6 +658,43 @@ def do_attach(path: str):
         s.close()
 
 
+def _daemonize(log_file: str, ctrl_sock: str):
+    """
+    Double-fork 守护进程化，父进程打印提示后立即退出，守护进程在后台运行。
+    """
+    pid = os.fork()
+    if pid > 0:
+        # 父进程：打印提示，然后退出（shell 立即拿回控制权）
+        sys.stdout.write(f"server 启动中，日志: {log_file}\n")
+        sys.stdout.write(f"进入交互: python3 server.py attach\n")
+        sys.stdout.flush()
+        os._exit(0)
+
+    # 第一子进程：setsid 脱离终端
+    os.setsid()
+
+    # 第二次 fork：防止重新获得控制终端
+    pid = os.fork()
+    if pid > 0:
+        os._exit(0)
+
+    # 最终守护进程：重定向所有 fd 到 /dev/null
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(devnull, fd)
+    os.close(devnull)
+
+    # 重建 logging，写到文件
+    for h in logging.root.handlers[:]:
+        logging.root.removeHandler(h)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [server] %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+        filename=log_file,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Server: 运行在控制机B，等待 Agent 连接",
@@ -685,26 +722,7 @@ def main():
         return
 
     if args.non_interactive:
-        # 立即 detach，在任何 I/O 之前脱离控制终端
-        signal.signal(signal.SIGTTOU, signal.SIG_IGN)
-        signal.signal(signal.SIGTTIN, signal.SIG_IGN)
-        try:
-            os.setsid()
-        except OSError:
-            pass
-        devnull = os.open(os.devnull, os.O_RDWR)
-        for fd in (0, 1, 2):
-            os.dup2(devnull, fd)
-        os.close(devnull)
-        # 重建 logging，写到文件
-        for h in logging.root.handlers[:]:
-            logging.root.removeHandler(h)
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s [server] %(levelname)s %(message)s",
-            datefmt="%H:%M:%S",
-            filename=args.log_file,
-        )
+        _daemonize(args.log_file, args.ctrl_sock)
 
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
