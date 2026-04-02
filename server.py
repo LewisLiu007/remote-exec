@@ -675,12 +675,36 @@ def main():
                         help="后台运行，不进入交互式界面，通过 attach 子命令连接操作")
     parser.add_argument("--ctrl-sock", default=DEFAULT_CTRL_SOCK,
                         help=f"控制 socket 路径（默认 {DEFAULT_CTRL_SOCK}，仅 --non-interactive 时有效）")
+    parser.add_argument("--log-file", default="/tmp/remote-exec-server.log",
+                        help="后台模式下的日志文件路径（默认 /tmp/remote-exec-server.log）")
 
     args = parser.parse_args()
 
     if args.command == "attach":
         do_attach(args.ctrl_sock)
         return
+
+    if args.non_interactive:
+        # 立即 detach，在任何 I/O 之前脱离控制终端
+        signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+        signal.signal(signal.SIGTTIN, signal.SIG_IGN)
+        try:
+            os.setsid()
+        except OSError:
+            pass
+        devnull = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(devnull, fd)
+        os.close(devnull)
+        # 重建 logging，写到文件
+        for h in logging.root.handlers[:]:
+            logging.root.removeHandler(h)
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [server] %(levelname)s %(message)s",
+            datefmt="%H:%M:%S",
+            filename=args.log_file,
+        )
 
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -693,17 +717,10 @@ def main():
 
     if args.non_interactive:
         start_ctrl_socket(args.ctrl_sock)
-        # 用 sys.stderr 输出，避免后台运行时因 stdout 写入终端触发 SIGTTOU 被挂起
-        sys.stderr.write(f"server 后台运行中。使用以下命令进入交互：\n")
-        sys.stderr.write(f"  python3 server.py attach --ctrl-sock {args.ctrl_sock}\n")
-        sys.stderr.flush()
-        # 忽略 SIGTTOU/SIGTTIN，防止意外的终端 I/O 挂起进程
-        signal.signal(signal.SIGTTOU, signal.SIG_IGN)
-        signal.signal(signal.SIGTTIN, signal.SIG_IGN)
         try:
             while True:
                 time.sleep(3600)
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, SystemExit):
             pass
     else:
         interactive(is_tty=sys.stdin.isatty())
