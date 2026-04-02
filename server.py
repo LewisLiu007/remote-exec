@@ -693,8 +693,13 @@ def main():
 
     if args.non_interactive:
         start_ctrl_socket(args.ctrl_sock)
-        print(f"server 后台运行中。使用以下命令进入交互：")
-        print(f"  python3 server.py attach --ctrl-sock {args.ctrl_sock}")
+        # 用 sys.stderr 输出，避免后台运行时因 stdout 写入终端触发 SIGTTOU 被挂起
+        sys.stderr.write(f"server 后台运行中。使用以下命令进入交互：\n")
+        sys.stderr.write(f"  python3 server.py attach --ctrl-sock {args.ctrl_sock}\n")
+        sys.stderr.flush()
+        # 忽略 SIGTTOU/SIGTTIN，防止意外的终端 I/O 挂起进程
+        signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+        signal.signal(signal.SIGTTIN, signal.SIG_IGN)
         try:
             while True:
                 time.sleep(3600)
